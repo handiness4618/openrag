@@ -1,6 +1,8 @@
 from utils.version_utils import OPENRAG_VERSION
 import asyncio
 import atexit
+import hashlib
+import httpx
 import os
 import subprocess
 
@@ -50,6 +52,7 @@ from config.settings import (
     API_KEYS_INDEX_BODY,
     API_KEYS_INDEX_NAME,
     DISABLE_INGEST_WITH_LANGFLOW,
+    FETCH_OPENRAG_DOCS_AT_STARTUP,
     INGESTION_TIMEOUT,
     INDEX_BODY,
     LANGFLOW_URL_INGEST_FLOW_ID,
@@ -325,6 +328,16 @@ def _get_documents_dir():
         return path
 
 
+def _should_use_url_default_docs_ingest() -> bool:
+    """Return whether default docs ingestion should use URL crawling."""
+    return (
+        DEFAULT_DOCS_INGEST_SOURCE == "url"
+        and not DISABLE_INGEST_WITH_LANGFLOW
+        and bool(LANGFLOW_URL_INGEST_FLOW_ID)
+        and bool(DEFAULT_DOCS_URL)
+    )
+
+
 async def ingest_default_documents_when_ready(
     document_service, task_service, langflow_file_service, session_manager
 ):
@@ -336,11 +349,7 @@ async def ingest_default_documents_when_ready(
             ingest_source=DEFAULT_DOCS_INGEST_SOURCE,
         )
         await TelemetryClient.send_event(Category.DOCUMENT_INGESTION, MessageId.ORB_DOC_DEFAULT_START)
-        use_url_ingest = (
-            DEFAULT_DOCS_INGEST_SOURCE == "url"
-            and not DISABLE_INGEST_WITH_LANGFLOW
-            and bool(LANGFLOW_URL_INGEST_FLOW_ID)
-        )
+        use_url_ingest = _should_use_url_default_docs_ingest()
         if (
             DEFAULT_DOCS_INGEST_SOURCE == "url"
             and not DISABLE_INGEST_WITH_LANGFLOW
@@ -578,7 +587,7 @@ async def _reingest_default_docs_on_upgrade_if_needed(
         should_reingest = True
 
     if not should_reingest:
-        return
+        return False
 
     logger.info(
         "Detected OpenRAG upgrade; reingesting default docs",
@@ -593,11 +602,124 @@ async def _reingest_default_docs_on_upgrade_if_needed(
         session_manager,
     )
     config.onboarding.openrag_docs_ingested_version = current_version
+    if _should_use_url_default_docs_ingest():
+        # Refresh signature metadata after upgrade reingestion so startup
+        # signature checks don't trigger an immediate duplicate ingest.
+        config.onboarding.openrag_docs_remote_signature = await _get_remote_docs_signature(
+            DEFAULT_DOCS_URL
+        )
+    else:
+        config.onboarding.openrag_docs_remote_signature = None
     if not config_manager.save_config_file(config):
         logger.warning(
-            "Default docs were reingested but failed to persist ingested version",
+            "Default docs were reingested but failed to persist metadata",
             current_version=current_version,
+            signature=config.onboarding.openrag_docs_remote_signature,
         )
+    return True
+
+
+async def _get_remote_docs_signature(docs_url: str):
+    """Get a signature for remote docs to detect content updates."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            head_response = await client.head(docs_url)
+            if head_response.status_code >= 400:
+                get_response = await client.get(docs_url)
+                if get_response.status_code >= 400:
+                    logger.warning(
+                        "Failed to fetch remote docs signature",
+                        docs_url=docs_url,
+                        status_code=get_response.status_code,
+                    )
+                    return None
+                return hashlib.sha256(get_response.text.encode("utf-8")).hexdigest()
+
+            etag = (head_response.headers.get("etag") or "").strip()
+            last_modified = (head_response.headers.get("last-modified") or "").strip()
+            if etag or last_modified:
+                return f"etag={etag}|last_modified={last_modified}"
+
+            # HEAD has no body. If cache headers are missing, fetch the page body.
+            get_response = await client.get(docs_url)
+            if get_response.status_code >= 400:
+                logger.warning(
+                    "Failed to fetch remote docs signature body fallback",
+                    docs_url=docs_url,
+                    status_code=get_response.status_code,
+                )
+                return None
+            return hashlib.sha256(get_response.text.encode("utf-8")).hexdigest()
+    except Exception as e:
+        logger.warning(
+            "Unable to retrieve remote docs signature",
+            docs_url=docs_url,
+            error=str(e),
+        )
+        return None
+
+
+async def refresh_default_openrag_docs(
+    document_service,
+    task_service,
+    langflow_file_service,
+    session_manager,
+    force: bool = False,
+    reason: str = "startup",
+):
+    """Refresh OpenRAG docs if remote content changed or when forced."""
+    if not _should_use_url_default_docs_ingest():
+        logger.info(
+            "Skipping OpenRAG docs refresh: URL ingestion is not active",
+            ingest_source=DEFAULT_DOCS_INGEST_SOURCE,
+            disable_langflow_ingest=DISABLE_INGEST_WITH_LANGFLOW,
+            has_url_ingest_flow_id=bool(LANGFLOW_URL_INGEST_FLOW_ID),
+            has_docs_url=bool(DEFAULT_DOCS_URL),
+        )
+        return False
+
+    config = get_openrag_config()
+    if not config.edited:
+        logger.info("Skipping OpenRAG docs refresh: onboarding not completed")
+        return False
+
+    signature = await _get_remote_docs_signature(DEFAULT_DOCS_URL)
+    if not signature and not force:
+        return False
+
+    previous_signature = config.onboarding.openrag_docs_remote_signature
+    should_refresh = force or (signature is not None and signature != previous_signature)
+    if not should_refresh:
+        logger.info(
+            "OpenRAG docs refresh skipped: remote signature unchanged",
+            signature=signature,
+        )
+        return False
+
+    logger.info(
+        "Refreshing default OpenRAG docs",
+        reason=reason,
+        force=force,
+        previous_signature=previous_signature,
+        new_signature=signature,
+    )
+    await _delete_existing_default_docs(session_manager)
+    await ingest_default_documents_when_ready(
+        document_service,
+        task_service,
+        langflow_file_service,
+        session_manager,
+    )
+    config.onboarding.openrag_docs_ingested_version = OPENRAG_VERSION
+    if signature:
+        config.onboarding.openrag_docs_remote_signature = signature
+    if not config_manager.save_config_file(config):
+        logger.warning(
+            "OpenRAG docs refreshed but failed to persist metadata",
+            version=config.onboarding.openrag_docs_ingested_version,
+            signature=config.onboarding.openrag_docs_remote_signature,
+        )
+    return True
 
 async def health_check(request: Request):
     """Simple liveness probe: Indicates that the OpenRAG Backend service is online and running."""
@@ -745,8 +867,9 @@ async def startup_tasks(services):
     await configure_alerting_security()
 
     # Reingest bundled OpenRAG docs once after application upgrade.
+    upgrade_reingested = False
     try:
-        await _reingest_default_docs_on_upgrade_if_needed(
+        upgrade_reingested = await _reingest_default_docs_on_upgrade_if_needed(
             services["document_service"],
             services["task_service"],
             services["langflow_file_service"],
@@ -754,6 +877,19 @@ async def startup_tasks(services):
         )
     except Exception as e:
         logger.warning("Default docs reingestion on upgrade failed", error=str(e))
+
+    if FETCH_OPENRAG_DOCS_AT_STARTUP and not upgrade_reingested:
+        try:
+            await refresh_default_openrag_docs(
+                services["document_service"],
+                services["task_service"],
+                services["langflow_file_service"],
+                services["session_manager"],
+                force=False,
+                reason="startup",
+            )
+        except Exception as e:
+            logger.warning("OpenRAG docs startup refresh failed", error=str(e))
 
     # Update MCP servers with provider credentials (especially important for no-auth mode)
     await _update_mcp_servers_with_provider_credentials(services)
@@ -966,6 +1102,7 @@ async def create_app():
     app.add_api_route("/settings", settings.get_settings, methods=["GET"], tags=["internal"])
     app.add_api_route("/settings", settings.update_settings, methods=["POST"], tags=["internal"])
     app.add_api_route("/onboarding/state", settings.update_onboarding_state, methods=["POST"], tags=["internal"])
+    app.add_api_route("/openrag-docs/refresh", settings.refresh_openrag_docs, methods=["POST"], tags=["internal"])
 
     # Provider health check endpoint
     app.add_api_route("/provider/health", provider_health.check_provider_health, methods=["GET"], tags=["internal"])
