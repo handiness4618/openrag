@@ -9,19 +9,20 @@ export function formatFilesToDelete(
   return (
     <ul className="list-disc pl-5">
       {visibleFiles.map((file) => (
-        <li
-          key={file.filename}
-          className="my-2"
-          title={file.filename}
-        >
+        <li key={file.filename} className="my-2" title={file.filename}>
           <p className="overflow-hidden text-ellipsis whitespace-nowrap max-w-[200px]">
             {file.filename}
           </p>
         </li>
       ))}
-      {remainingCount > 0 ? <li>&hellip; and {remainingCount} more document{
-        remainingCount > 1 ? "s" : ""
-      }</li> : "" }
+      {remainingCount > 0 ? (
+        <li>
+          &hellip; and {remainingCount} more document
+          {remainingCount > 1 ? "s" : ""}
+        </li>
+      ) : (
+        ""
+      )}
     </ul>
   );
 }
