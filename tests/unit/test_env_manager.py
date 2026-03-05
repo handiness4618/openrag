@@ -87,6 +87,25 @@ class TestSaveEnvFilePermissions:
             f"expected 0o600, got {oct(_perms(backups[0]))}"
         )
 
+    def test_preserves_unmanaged_env_variables(self, env_manager, tmp_path):
+        """Saving config must keep existing .env keys that TUI does not manage."""
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "OPENRAG_BACKEND_HOST='my-host'\n"
+            "OPENSEARCH_PASSWORD='old-password'\n"
+        )
+
+        env_manager.config.opensearch_password = "NewSecurePass!123"
+
+        with patch("tui.utils.version_check.get_current_version", return_value="1.0.0"):
+            result = env_manager.save_env_file()
+
+        assert result is True
+        content = env_file.read_text()
+        assert "OPENRAG_BACKEND_HOST='my-host'" in content
+        assert content.count("OPENRAG_BACKEND_HOST=") == 1
+        assert "OPENSEARCH_PASSWORD='NewSecurePass!123'" in content
+
 
 # ---------------------------------------------------------------------------
 # ensure_openrag_version

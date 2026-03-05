@@ -1,6 +1,7 @@
 """Environment configuration manager for OpenRAG TUI."""
 
 import os
+import re
 import secrets
 import string
 from dataclasses import dataclass, field
@@ -155,19 +156,9 @@ class EnvManager:
         escaped_value = value.replace("'", "'\\''")
         return f"'{escaped_value}'"
 
-    def load_existing_env(self) -> bool:
-        """Load existing .env file if it exists, or fall back to environment variables.
-
-        Uses python-dotenv's load_dotenv() for standard .env file parsing, which handles:
-        - Quoted values (single and double quotes)
-        - Variable expansion (${VAR})
-        - Multiline values
-        - Escaped characters
-        - Comments
-        """
-        # Map env vars to config attributes
-        # These are environment variable names, not actual secrets
-        attr_map = {  # pragma: allowlist secret
+    def _env_attr_map(self) -> Dict[str, str]:
+        """Map env vars to EnvConfig attribute names."""
+        return {  # pragma: allowlist secret
             "OPENAI_API_KEY": "openai_api_key",  # pragma: allowlist secret
             "ANTHROPIC_API_KEY": "anthropic_api_key",  # pragma: allowlist secret
             "OLLAMA_ENDPOINT": "ollama_endpoint",
@@ -211,6 +202,48 @@ class EnvManager:
             "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",  # pragma: allowlist secret
             "LANGFUSE_HOST": "langfuse_host",
         }
+
+    def _collect_preserved_env_lines(self) -> list[str]:
+        """Collect existing .env assignments not managed by this TUI."""
+        if not self.env_file.exists():
+            return []
+
+        managed_vars = set(self._env_attr_map().keys())
+        assignment_pattern = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+        preserved_lines: list[str] = []
+
+        try:
+            for raw_line in self.env_file.read_text().splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+
+                match = assignment_pattern.match(raw_line)
+                if not match:
+                    continue
+
+                env_var = match.group(1)
+                if env_var in managed_vars:
+                    continue
+                preserved_lines.append(raw_line)
+        except Exception:
+            logger.warning(f"Failed to preserve custom .env lines from {self.env_file}")
+
+        return preserved_lines
+
+    def load_existing_env(self) -> bool:
+        """Load existing .env file if it exists, or fall back to environment variables.
+
+        Uses python-dotenv's load_dotenv() for standard .env file parsing, which handles:
+        - Quoted values (single and double quotes)
+        - Variable expansion (${VAR})
+        - Multiline values
+        - Escaped characters
+        - Comments
+        """
+        # Map env vars to config attributes
+        # These are environment variable names, not actual secrets
+        attr_map = self._env_attr_map()
 
         loaded_from_file = False
 
@@ -371,6 +404,7 @@ class EnvManager:
         try:
             # Ensure secure defaults (including Langflow secret key) are set before saving
             self.setup_secure_defaults()
+            preserved_custom_lines = self._collect_preserved_env_lines()
             # Create timestamped backup if file exists
             if self.env_file.exists():
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -550,6 +584,12 @@ class EnvManager:
                         f.write(f"{var_name}={self._quote_env_value(var_value)}\n")
 
                 if langfuse_written:
+                    f.write("\n")
+
+                if preserved_custom_lines:
+                    f.write("# Preserved custom settings\n")
+                    for line in preserved_custom_lines:
+                        f.write(f"{line}\n")
                     f.write("\n")
 
                 f.flush()
