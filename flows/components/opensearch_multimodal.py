@@ -1688,6 +1688,38 @@ class OpenSearchVectorStoreComponentMultimodalMultiEmbedding(LCVectorStoreCompon
                     )
                 raise
 
+        def run_legacy_vector_fallback(reason: str):
+            fallback_vector = next(iter(query_embeddings.values()), None)
+            if fallback_vector is None:
+                return run_keyword_fallback(f"{reason}; no query embeddings available")
+
+            fallback_field = legacy_vector_field or "chunk_embedding"
+            logger.warning(
+                "KNN search failed for dynamic fields; falling back to legacy field '%s'.",
+                fallback_field,
+            )
+            self.log(f"[FALLBACK] Legacy vector fallback: field={fallback_field}; reason={reason}")
+
+            fallback_body = copy.deepcopy(body)
+            fallback_body["query"]["bool"]["filter"] = filter_clauses
+            knn_fallback = {
+                "knn": {
+                    fallback_field: {
+                        "vector": fallback_vector,
+                        "k": 50,
+                    }
+                }
+            }
+            if use_num_candidates:
+                knn_fallback["knn"][fallback_field]["num_candidates"] = num_candidates
+            fallback_body["query"]["bool"]["should"][0]["dis_max"]["queries"] = [knn_fallback]
+
+            return client.search(
+                index=self.index_name,
+                body=fallback_body,
+                params={"terminate_after": 0},
+            )
+
         if not knn_queries_with_candidates:
             # No valid fields found - this can happen when:
             # 1. Index is empty (no documents yet)
@@ -1801,11 +1833,17 @@ class OpenSearchVectorStoreComponentMultimodalMultiEmbedding(LCVectorStoreCompon
                     )
                 except RequestError as retry_error:
                     retry_error_message = str(retry_error)
-                    resp = run_keyword_fallback(
-                        f"search failed after num_candidates retry: {retry_error_message}"
-                    )
+                    retry_lowered = retry_error_message.lower()
+                    if "knn_vector" in retry_lowered or ("field" in retry_lowered and "knn" in retry_lowered):
+                        resp = run_legacy_vector_fallback(
+                            f"search failed after num_candidates retry: {retry_error_message}"
+                        )
+                    else:
+                        resp = run_keyword_fallback(
+                            f"search failed after num_candidates retry: {retry_error_message}"
+                        )
             elif "knn_vector" in lowered or ("field" in lowered and "knn" in lowered):
-                resp = run_keyword_fallback(f"knn query error: {error_message}")
+                resp = run_legacy_vector_fallback(f"knn query error: {error_message}")
             else:
                 raise
         hits = resp.get("hits", {}).get("hits", [])
