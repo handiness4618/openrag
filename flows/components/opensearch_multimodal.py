@@ -1701,7 +1701,12 @@ class OpenSearchVectorStoreComponentMultimodalMultiEmbedding(LCVectorStoreCompon
             self.log(f"[FALLBACK] Legacy vector fallback: field={fallback_field}; reason={reason}")
 
             fallback_body = copy.deepcopy(body)
-            fallback_body["query"]["bool"]["filter"] = filter_clauses
+            # Keep user filters and explicitly require the legacy embedding field to exist.
+            # This avoids returning documents without embeddings during semantic fallback.
+            fallback_body["query"]["bool"]["filter"] = [
+                *filter_clauses,
+                {"exists": {"field": fallback_field}},
+            ]
             knn_fallback = {
                 "knn": {
                     fallback_field: {
