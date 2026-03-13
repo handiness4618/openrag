@@ -25,7 +25,6 @@ docs: {
 
 ## Create docs versions
 
-See the [Docusaurus docs](https://docusaurus.io/docs/versioning) for more info.
 
 1. Use the Docusaurus CLI command to create a version.
 ```bash
